@@ -1,0 +1,62 @@
+import pandas as pd
+
+raw_data = pd.read_csv(r'C:Gestational Diabetic Dat Set.csv')
+print(raw_data.info())
+print(raw_data['BMI'].isna().sum())
+
+# STEP 1: remove nan values to achieve even class numbers 
+
+# There are 483 samples with nan values for BMI and Sys BP 
+# Remove the 483 nan values
+fil_df = raw_data[~(raw_data['BMI'].isna() & raw_data['Sys BP'].isna())] # ~ negates conditions 
+
+# remove 298 nan values from OGTT so class numbers are equal and removes nan values from OGTT
+nan_OGTT = raw_data[raw_data['OGTT'].isna()] #513 
+# Randomly sample 298 rows 
+rows_to_remove = nan_OGTT.sample(n=298, random_state=42)
+# Remove those sampled rows from the dataset
+filtered_data = fil_df.drop(rows_to_remove.index)
+
+# check classes are equal 
+print((filtered_data['Class Label(GDM /Non GDM)']==0).sum()) 
+print((filtered_data['Class Label(GDM /Non GDM)']==1).sum()) # both are 1372 
+
+#check  the nan values are as expected 
+cols_with_nan = filtered_data.columns[filtered_data.isna().any()] 
+nan_values = filtered_data[cols_with_nan].isna().sum() # numbers are as expected 
+
+# set 'case number' column as index 
+dataset = filtered_data.set_index('Case Number')
+
+# STEP 2: handle remaining missing values 
+# NAN missingness indicators used 
+# Predictions of missing values risks introducing incorrect data and influencing models outputs
+
+# STEP 3: check for duplicate rows 
+print(dataset.duplicated().sum()) # no duplicates present 
+
+# STEP 4: assign variables 
+
+y = dataset['Class Label(GDM /Non GDM)']
+x = dataset.iloc[:,:-1]
+
+#STEP 5: train test split 
+from sklearn.model_selection import train_test_split
+x_train, x_test, y_train, y_test = train_test_split(x, y, random_state=42, test_size=0.3, stratify=y)
+
+# STEP 6: model pipelines with feature scaling and class imbalance 
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+
+
+
+
+log_reg_pipeline = Pipeline(steps=[('standardscaler', StandardScaler()),
+    ('logisticregression', LogisticRegression(class_weight='balanced', max_iter=1000))])
+
+
+rf_pipeline = Pipeline(steps=[('standardscaler', StandardScaler()),
+    ('randomforest', RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42,))])
+
