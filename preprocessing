@@ -1,15 +1,6 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Thu Jan 29 13:32:03 2026
-
-@author: Jsscb
-"""
-
-
-
 import pandas as pd
 
-raw_data = pd.read_csv(r'C:\Users\Jsscb\OneDrive - University of Exeter\Documents\University\Final Year\Research project\Gestational Diabetic Dat Set.csv')
+raw_data = pd.read_csv(r'Gestational Diabetic Dat Set.csv')
 print(raw_data.info())
 print(raw_data['BMI'].isna().sum())
 
