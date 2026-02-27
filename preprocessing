@@ -1,9 +1,19 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Jan 29 13:32:03 2026
+
+@author: Jsscb
+"""
+
+
+
 import pandas as pd
 
-raw_data = pd.read_csv(r'C:Gestational Diabetic Dat Set.csv')
+raw_data = pd.read_csv(r'C:\Users\Jsscb\OneDrive - University of Exeter\Documents\University\Final Year\Research project\Gestational Diabetic Dat Set.csv')
 print(raw_data.info())
 print(raw_data['BMI'].isna().sum())
 
+#%% Preprocessing 
 # STEP 1: remove nan values to achieve even class numbers 
 
 # There are 483 samples with nan values for BMI and Sys BP 
@@ -28,35 +38,145 @@ nan_values = filtered_data[cols_with_nan].isna().sum() # numbers are as expected
 # set 'case number' column as index 
 dataset = filtered_data.set_index('Case Number')
 
-# STEP 2: handle remaining missing values 
-# NAN missingness indicators used 
-# Predictions of missing values risks introducing incorrect data and influencing models outputs
-
-# STEP 3: check for duplicate rows 
+# STEP 2: check for duplicate rows 
 print(dataset.duplicated().sum()) # no duplicates present 
+
+# STEP 3: handle remaining missing values 
+# Log reg and NN cannot handle NAN values 
+# group-based mean imputation
+
+# Replace columns with NaN with the mean values of the same class label 
+dataset_fil = dataset.copy()
+dataset_fil['BMI'] = dataset.groupby('Class Label(GDM /Non GDM)').BMI.transform(lambda x: x.fillna(x.mean()))
+dataset_fil['HDL'] = dataset.groupby('Class Label(GDM /Non GDM)').BMI.transform(lambda x: x.fillna(x.mean()))
+dataset_fil['Sys BP'] = dataset.groupby('Class Label(GDM /Non GDM)').BMI.transform(lambda x: x.fillna(x.mean()))
+dataset_fil['OGTT'] = dataset.groupby('Class Label(GDM /Non GDM)').BMI.transform(lambda x: x.fillna(x.mean()))
+
+# check NAN values 
+print(dataset_fil.isna().sum())
 
 # STEP 4: assign variables 
 
-y = dataset['Class Label(GDM /Non GDM)']
-x = dataset.iloc[:,:-1]
+y = dataset_fil['Class Label(GDM /Non GDM)']
+x = dataset_fil.iloc[:,:-1]
 
-#STEP 5: train test split 
+#STEP 5: train test split (train = 70%) 
 from sklearn.model_selection import train_test_split
-x_train, x_test, y_train, y_test = train_test_split(x, y, random_state=42, test_size=0.3, stratify=y)
+x_train, x_temp, y_train, y_temp = train_test_split(x, y, random_state=42, test_size=0.30, stratify=y)
 
-# STEP 6: model pipelines with feature scaling and class imbalance 
+# assign test and validation sets (both 15%)
+x_test, x_val, y_test, y_val = train_test_split(
+    x_temp, y_temp,
+    test_size=0.50,
+    random_state=42,
+    stratify=y_temp
+)
+
+#%% Pipelines 
+# STEP 6: model pipelines with feature scaling, class imbalance and model specific parameters
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+from sklearn.neural_network import MLPClassifier
+
+
+
+log_reg_pipeline = Pipeline(steps=[
+    ('standardscaler', StandardScaler()),
+    ('logisticregression', LogisticRegression(max_iter=100))
+    ])
+
+rf_pipeline = Pipeline(steps=[
+    ('standardscaler', StandardScaler()),
+    ('randomforest', RandomForestClassifier(n_estimators=100, random_state=42,))
+    ])
+
+
+XG_pipeline = Pipeline(steps=[
+    ('XGBoost', XGBClassifier(n_estimators=41, random_state=42, eval_metric="error", early_stopping_rounds=10))
+    ])
+
+
+NN_pipeline = Pipeline(steps=[
+    ('standardscaler', StandardScaler()),
+    ('neuralnetwork', MLPClassifier(hidden_layer_sizes=(64, 32), early_stopping=True, random_state=42))
+    ])
 
 
 
 
-log_reg_pipeline = Pipeline(steps=[('standardscaler', StandardScaler()),
-    ('logisticregression', LogisticRegression(class_weight='balanced', max_iter=1000))])
+#%% Training the models
+from sklearn.metrics import accuracy_score, classification_report
 
 
-rf_pipeline = Pipeline(steps=[('standardscaler', StandardScaler()),
-    ('randomforest', RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42,))])
+#%% Logistic Regression 
+log_reg_pipeline.fit(x_train, y_train)
+log_predict = log_reg_pipeline.predict(x_test)
+
+log_proba = log_reg_pipeline.predict_proba(x_test)[:,1] # probability of class 1 (GDM)
+
+log_accuracy = accuracy_score(y_test, log_predict)
+log_classification = classification_report(y_test, log_predict)
+
+print(log_accuracy)
+print(log_classification)
+
+
+#%% Random Forest 
+rf_pipeline.fit(x_train, y_train)
+rf_predict = rf_pipeline.predict(x_test)
+
+rf_accuracy = accuracy_score(y_test, rf_predict)
+rf_classification = classification_report(y_test, rf_predict)
+
+print(rf_accuracy)
+print(rf_classification)
+
+
+#%% XGBoost 
+# Evaluating model performance during training 
+
+XG_pipeline = Pipeline(steps=[
+    ('XGBoost', XGBClassifier(n_estimators=100, random_state=42, eval_metric="logloss", early_stopping_rounds=20))
+    ])
+
+XG_pipeline.fit(
+    x_train,
+    y_train,
+    XGBoost__eval_set=[(x_train, y_train), (x_val, y_val)],
+    XGBoost__verbose=True
+)
+
+XG_predict = XG_pipeline.predict(x_test)
+
+XG_accuracy = accuracy_score(y_test, XG_predict)
+XG_classification = classification_report(y_test, XG_predict)
+
+print(XG_accuracy)
+print(XG_classification)
+
+# evaluate model performance with validation set 
+XG_results = XG_pipeline.named_steps['XGBoost'].evals_result()
+epochs = len(XG_results['validation_0']['logloss'])
+x_axis = range(0, epochs)
+
+from matplotlib import pyplot as plt
+
+# plot classification error
+fig, ax = plt.subplots()
+ax.plot(x_axis, XG_results['validation_0']['logloss'], label='Train')
+ax.plot(x_axis, XG_results['validation_1']['logloss'], label='Validation')
+ax.legend()
+plt.ylabel('logloss')
+plt.xlabel('Boosting Round')
+plt.title('XGBoost Classification Error')
+plt.show()
+
+
+
+#%% Neural network 
+NN_pipeline.fit(x_train, y_train)
+
 
