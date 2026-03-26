@@ -1,0 +1,486 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Jan 29 13:32:03 2026
+
+@author: Jsscb
+"""
+
+
+
+import pandas as pd
+
+raw_data = pd.read_csv(r'C:Gestational Diabetic Dat Set.csv')
+print(raw_data.info())
+print(raw_data['BMI'].isna().sum())
+
+#%% Preprocessing 
+# STEP 1: remove nan values to achieve even class numbers 
+
+# There are 483 samples with nan values for BMI and Sys BP 
+# Remove the 483 nan values
+fil_df = raw_data[~(raw_data['BMI'].isna() & raw_data['Sys BP'].isna())] # ~ negates conditions 
+
+# remove 298 nan values from OGTT so class numbers are equal and removes nan values from OGTT
+nan_OGTT = raw_data[raw_data['OGTT'].isna()] #513 
+# Randomly sample 298 rows 
+rows_to_remove = nan_OGTT.sample(n=298, random_state=42)
+# Remove those sampled rows from the dataset
+filtered_data = fil_df.drop(rows_to_remove.index)
+
+# check classes are equal 
+print((filtered_data['Class Label(GDM /Non GDM)']==0).sum()) 
+print((filtered_data['Class Label(GDM /Non GDM)']==1).sum()) # both are 1372 
+
+#check  the nan values are as expected 
+cols_with_nan = filtered_data.columns[filtered_data.isna().any()] 
+nan_values = filtered_data[cols_with_nan].isna().sum() # numbers are as expected 
+
+# set 'case number' column as index 
+dataset = filtered_data.set_index('Case Number')
+
+# STEP 2: check for duplicate rows 
+print(dataset.duplicated().sum()) # no duplicates present 
+
+# STEP 3: handle remaining missing values 
+# Log reg and NN cannot handle NAN values 
+# group-based mean imputation
+
+# Replace columns with NaN with the mean values of the same class label 
+dataset_fil = dataset.copy()
+cols = ['BMI', 'HDL', 'Sys BP', 'OGTT']
+
+for col in cols:
+    dataset_fil[col] = dataset.groupby('Class Label(GDM /Non GDM)')[col] \
+                              .transform(lambda x: x.fillna(x.mean()))
+# check NAN values 
+print(dataset_fil.isna().sum())
+
+# STEP 4: assign variables 
+
+y = dataset_fil['Class Label(GDM /Non GDM)']
+x = dataset_fil.iloc[:,:-1]
+
+#STEP 5: train test split (train = 70%) 
+from sklearn.model_selection import train_test_split
+x_train, x_temp, y_train, y_temp = train_test_split(x, y, random_state=42, test_size=0.30, stratify=y)
+
+# assign test and validation sets (both 15%)
+x_test, x_val, y_test, y_val = train_test_split(x_temp, y_temp, test_size=0.50, random_state=42, stratify=y_temp)
+
+#%% Pipelines 
+# STEP 6: model pipelines with feature scaling, class imbalance and model specific parameters
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.model_selection import TunedThresholdClassifierCV
+from sklearn.metrics import make_scorer, recall_score, precision_score, accuracy_score, classification_report
+from sklearn.metrics import ConfusionMatrixDisplay
+import seaborn as sns 
+import shap 
+from matplotlib import pyplot as plt
+
+#%% Logistic Regression 
+
+# Custom scorer: recall with minimum precision constraint
+def recall_with_precision_constraint(y_true, y_pred, min_precision=0.9):
+    precision = precision_score(y_true, y_pred)
+    recall = recall_score(y_true, y_pred)
+    
+    # Penalise if precision is below the minimum
+    if precision < min_precision:
+        return 0.0
+    return recall
+
+# Make scorer
+scorer = make_scorer(recall_with_precision_constraint)
+
+# Threshold-tuned model
+Log_reg_base = LogisticRegression(max_iter=100)
+Log_reg_model = TunedThresholdClassifierCV(estimator=Log_reg_base, scoring=scorer)
+
+log_reg_pipeline = Pipeline(steps=[
+    ('standardscaler', StandardScaler()),
+    ('logisticregression', Log_reg_model)])
+
+log_reg_pipeline.fit(x_train, y_train)
+
+log_predict = log_reg_pipeline.predict(x_test)
+log_proba = log_reg_pipeline.predict_proba(x_test)[:,1] # probability of class 1 (GDM)
+
+log_accuracy = accuracy_score(y_test, log_predict)
+log_classification = classification_report(y_test, log_predict, output_dict=True)
+
+print(log_accuracy)
+print(log_classification)
+
+# Threshold used
+log_threshold = log_reg_pipeline.named_steps['logisticregression'].best_threshold_
+print("Best threshold:", log_threshold)
+
+# Number of iterations the underlying LogisticRegression used
+print(log_reg_pipeline.named_steps['logisticregression'].estimator_.n_iter_) #14 
+
+ConfusionMatrixDisplay.from_predictions(y_test, log_predict,
+    display_labels=["No GDM", "GDM"],
+    cmap="Blues")
+
+plt.title("Confusion Matrix - Logistic Regression")
+plt.show()
+
+
+# plotting misclassified samples 
+log_df = pd.DataFrame({
+    'True Label': y_test,
+    'Predicted Probability': log_proba,
+    'Predicted Label': log_predict})
+
+log_df['Misclassified'] = log_df['True Label'] != log_df['Predicted Label']
+log_df['True Label'] = log_df['True Label'].map({0: 'No GDM', 1: 'GDM'})
+
+plt.figure(figsize=(8,6))
+sns.swarmplot(
+    data=log_df,
+    x='Predicted Probability',
+    y='True Label',
+    hue='Misclassified',
+    palette={False: 'blue', True: 'red'},
+    alpha=0.7)
+
+plt.axvline(log_threshold, linestyle='--', label=f'Threshold = {log_threshold:.2f}')
+
+plt.title('Logistic Regression Predicted Probabilities by True Class')
+plt.ylabel('True Class')
+plt.xlabel('Predicted Probability')
+
+plt.legend(title='Misclassified')
+plt.show()
+#%% Random Forest 
+
+rf_base = RandomForestClassifier(n_estimators=100, random_state=42, criterion='log_loss')
+rf_model = TunedThresholdClassifierCV(estimator=rf_base, scoring=scorer)
+
+rf_pipeline = Pipeline(steps=[('randomforest', rf_model)])
+                              
+rf_pipeline.fit(x_train, y_train)
+
+rf_predict = rf_pipeline.predict(x_test)
+rf_proba = rf_pipeline.predict_proba(x_test)[:,1] # probability of class 1 (GDM)
+
+rf_accuracy = accuracy_score(y_test, rf_predict)
+rf_classification = classification_report(y_test, rf_predict, output_dict=True)
+
+print(rf_accuracy)
+print(rf_classification)
+
+# Threshold used
+rf_threshold = rf_pipeline.named_steps['randomforest'].best_threshold_
+print("Best threshold:", rf_threshold)
+
+ConfusionMatrixDisplay.from_predictions(y_test, rf_predict,
+    display_labels=["No GDM", "GDM"],
+    cmap="Blues")
+
+plt.title("Confusion Matrix - Random Forest")
+plt.show()
+
+
+# plotting misclassified samples 
+rf_df = pd.DataFrame({
+    'True Label': y_test,
+    'Predicted Probability': rf_proba,
+    'Predicted Label': rf_predict})
+
+rf_df['Misclassified'] = rf_df['True Label'] != rf_df['Predicted Label']
+rf_df['True Label'] = rf_df['True Label'].map({0: 'No GDM', 1: 'GDM'})
+
+plt.figure(figsize=(8,6))
+sns.swarmplot(
+    data=rf_df,
+    x='Predicted Probability',
+    y='True Label',
+    hue='Misclassified',
+    palette={False: 'blue', True: 'red'},
+    alpha=0.7)
+
+plt.axvline(rf_threshold, linestyle='--', label=f'Threshold = {rf_threshold:.2f}')
+
+plt.title('Random Forest Predicted Probabilities by True Class')
+plt.ylabel('True Class')
+plt.xlabel('Predicted Probability')
+
+plt.legend(title='Misclassified')
+plt.show()
+
+# less unique probabilities, hence why there looks like there's less data points compared to LG/NN 
+print(len(rf_proba))
+print(len(set(rf_proba)))    
+#%% XGBoost with early stopping 
+XG_model = XGBClassifier(n_estimators=100, random_state=42, eval_metric="logloss", early_stopping_rounds=20)
+
+XG_model.fit(x_train, y_train,
+    eval_set=[(x_train, y_train), (x_val, y_val)],
+    verbose=True)
+
+
+XG_predict = XG_model.predict(x_test)
+
+XG_accuracy = accuracy_score(y_test, XG_predict)
+XG_classification = classification_report(y_test, XG_predict, output_dict=True)
+
+print(XG_accuracy)
+print(XG_classification)
+
+
+XG_results = XG_model.evals_result()
+
+train_loss = XG_results['validation_0']['logloss']
+val_loss = XG_results['validation_1']['logloss']
+
+epochs = len(train_loss)
+x_axis = range(epochs)
+
+
+plt.figure()
+plt.plot(x_axis, train_loss, label='Train')
+plt.plot(x_axis, val_loss, label='Validation')
+# Mark best iteration (early stopping point)
+best_iter = XG_model.best_iteration
+best_score = val_loss[best_iter]
+
+plt.axvline(best_iter, linestyle='--', label='Best Iteration')
+plt.scatter(best_iter, best_score)
+
+plt.legend()
+plt.xlabel('Boosting Round')
+plt.ylabel('Log Loss')
+plt.title('XGBoost Learning Curve with Early Stopping')
+
+plt.show()
+
+# -------------------------------
+# 7. Print Best Iteration Info
+# -------------------------------
+print("Best iteration:", XG_model.best_iteration)
+print("Best validation logloss:", XG_model.best_score)
+
+
+
+#%% XGBoost with threshold tuning (implement ooptimum number of iterations)
+
+XG_base = XGBClassifier(n_estimators=14, random_state=42, eval_metric="logloss")
+XG_base_model = TunedThresholdClassifierCV(estimator=XG_base, scoring=scorer)
+
+XG_pipeline = Pipeline(steps=[('XGBoost', XG_base_model)])
+                              
+XG_pipeline.fit(x_train, y_train)
+
+XG_pipe_predict = XG_pipeline.predict(x_test)
+XG_pipe_proba = XG_pipeline.predict_proba(x_test)[:,1] # probability of class 1 (GDM)
+
+XG_pipe_accuracy = accuracy_score(y_test, XG_pipe_predict)
+XG_pipe_classification = classification_report(y_test, XG_pipe_predict, output_dict=True)
+
+print(XG_pipe_accuracy)
+print(XG_pipe_classification)
+
+# Threshold used
+XG_threshold = XG_pipeline.named_steps['XGBoost'].best_threshold_
+print("Best threshold:", XG_threshold)
+
+ConfusionMatrixDisplay.from_predictions(y_test, XG_pipe_predict,
+    display_labels=["No GDM", "GDM"],
+    cmap="Blues")
+
+plt.title("Confusion Matrix - XGBoost")
+plt.show()
+
+# plotting misclassified samples 
+XG_df = pd.DataFrame({
+    'True Label': y_test,
+    'Predicted Probability': XG_pipe_proba,
+    'Predicted Label': XG_pipe_predict})
+
+XG_df['Misclassified'] = XG_df['True Label'] != XG_df['Predicted Label']
+XG_df['True Label'] = XG_df['True Label'].map({0: 'No GDM', 1: 'GDM'})
+
+plt.figure(figsize=(8,6))
+sns.swarmplot(
+    data=XG_df,
+    x='Predicted Probability',
+    y='True Label',
+    hue='Misclassified',
+    palette={False: 'blue', True: 'red'},
+    alpha=0.7)
+
+plt.axvline(XG_threshold, linestyle='--', label=f'Threshold = {XG_threshold:.2f}')
+
+plt.title('XGBoost Predicted Probabilities by True Class')
+plt.ylabel('True Class')
+plt.xlabel('Predicted Probability')
+
+plt.legend(title='Misclassified')
+plt.show()
+
+
+#%% Neural network 
+
+NN_base = MLPClassifier(hidden_layer_sizes=(64, 32), early_stopping=True, random_state=42)
+NN_model = TunedThresholdClassifierCV(estimator=NN_base, scoring=scorer)
+
+NN_pipeline = Pipeline(steps=[
+    ('standardscaler', StandardScaler()),
+    ('neuralnetwork', NN_model)])
+
+NN_pipeline.fit(x_train, y_train)
+
+NN_predict = NN_pipeline.predict(x_test)
+NN_proba = NN_pipeline.predict_proba(x_test)[:,1] # probability of class 1 (GDM)
+
+NN_accuracy = accuracy_score(y_test, NN_predict)
+NN_classification = classification_report(y_test, NN_predict, output_dict=True)
+
+print(NN_accuracy)
+print(NN_classification)
+
+# Access the MLPClassifier inside the pipeline
+mlp = NN_pipeline.named_steps['neuralnetwork'].estimator_
+# how many epochs the training ran before stopping
+print("Number of epochs run:", mlp.n_iter_)
+
+# Plot the loss curve
+plt.figure(figsize=(8,5))
+plt.plot(mlp.loss_curve_, label='Training Loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.title('Neural Network Training Loss Curve')
+plt.axvline(mlp.n_iter_-1, color='r', linestyle='--', label="Early stopping triggered")
+plt.legend()
+plt.show()
+
+# Threshold used
+NN_threshold = NN_pipeline.named_steps['neuralnetwork'].best_threshold_
+print("Best threshold:", NN_threshold)
+
+
+ConfusionMatrixDisplay.from_predictions(y_test, NN_predict,
+    display_labels=["No GDM", "GDM"],
+    cmap="Blues")
+
+plt.title("Confusion Matrix - Neural Network")
+plt.show()
+
+
+# plotting misclassified samples 
+NN_df = pd.DataFrame({
+    'True Label': y_test,
+    'Predicted Probability': NN_proba,
+    'Predicted Label': NN_predict})
+
+NN_df['Misclassified'] = NN_df['True Label'] != NN_df['Predicted Label']
+NN_df['True Label'] = NN_df['True Label'].map({0: 'No GDM', 1: 'GDM'})
+
+plt.figure(figsize=(8,6))
+sns.swarmplot(
+    data=NN_df,
+    x='Predicted Probability',
+    y='True Label',
+    hue='Misclassified',
+    palette={False: 'blue', True: 'red'},
+    alpha=0.7)
+
+plt.axvline(NN_threshold, linestyle='--', label=f'Threshold = {NN_threshold:.2f}')
+
+plt.title('Neural Network Predicted Probabilities by True Class')
+plt.ylabel('True Class')
+plt.xlabel('Predicted Probability')
+
+plt.legend(title='Misclassified')
+plt.show()
+#%% 
+
+# Grpahical representation of model performance 
+
+# performace metrics df 
+accuracy_scores = {
+    "Model": ["Logistic Regression", "Random Forest", "XGBoost", "Neural Network"],
+    "Accuracy": [log_accuracy, rf_accuracy, XG_pipe_accuracy, NN_accuracy]
+}
+
+accuracy_df = pd.DataFrame(accuracy_scores).set_index('Model').transpose()
+
+LR_performance = pd.DataFrame(log_classification).transpose()
+RF_performance = pd.DataFrame(rf_classification).transpose()
+XG_performance = pd.DataFrame(XG_pipe_classification).transpose() 
+NN_performance = pd.DataFrame(NN_classification).transpose()
+
+
+LR_avg = pd.DataFrame(LR_performance.iloc[4,:]).rename(columns = {'weighted avg':'Logistic Regression'})
+RF_avg = pd.DataFrame(RF_performance.iloc[4,:]).rename(columns = {'weighted avg':'Random Forest'})
+XG_avg = pd.DataFrame(XG_performance.iloc[4,:]).rename(columns = {'weighted avg':'XGBoost'})
+NN_avg = pd.DataFrame(NN_performance.iloc[4,:]).rename(columns = {'weighted avg':'Neural Network'})
+
+avg_scores = pd.concat([LR_avg, RF_avg, XG_avg, NN_avg], axis=1)
+
+LR_0 = pd.DataFrame(LR_performance.iloc[0,:]).rename(columns = {'0':'Logistic Regression (0)'})
+RF_0 = pd.DataFrame(RF_performance.iloc[0,:]).rename(columns = {'0':'Random Forest (0)'})
+XG_0 = pd.DataFrame(XG_performance.iloc[0,:]).rename(columns = {'0':'XGBoost (0)'})
+NN_0 = pd.DataFrame(NN_performance.iloc[0,:]).rename(columns = {'0':'Neural Network (0)'})
+
+                        
+class_0_scores = pd.concat([LR_0, RF_0, XG_0, NN_0], axis=1)
+
+LR_1 = pd.DataFrame(LR_performance.iloc[1,:]).rename(columns = {'1':'Logistic Regression (1)'})
+RF_1 = pd.DataFrame(RF_performance.iloc[1,:]).rename(columns = {'1':'Random Forest (1)'})
+XG_1 = pd.DataFrame(XG_performance.iloc[1,:]).rename(columns = {'1':'XGBoost (1)'})
+NN_1 = pd.DataFrame(NN_performance.iloc[1,:]).rename(columns = {'1':'Neural Network (1)'})
+                        
+class_1_scores = pd.concat([LR_1, RF_1, XG_1, NN_1], axis=1)   
+                                         
+Performance_scores = pd.concat([class_0_scores, class_1_scores, accuracy_df], axis=0).transpose()
+
+
+import seaborn as sns 
+#Accuracy plot
+plt.figure(figsize=(7,7)) 
+sns.barplot(data=Performance_scores, x='Model', y='Accuracy', width=0.5, hue='Model', 
+            order=['Logistic Regression', 'XGBoost', 'Random Forest', 'Neural Network'] )
+plt.ylim(0.92, 0.98)
+plt.tick_params(axis='x', rotation=45)
+plt.ylabel('Score (%)')
+plt.title('Accuracy')
+plt.show()
+
+# Precision 
+plt.figure(figsize=(7,7)) 
+sns.barplot(data=Performance_scores, x='Model', y='precision', width=0.5, hue='Model', 
+            order=['Logistic Regression', 'XGBoost', 'Random Forest', 'Neural Network'] )
+plt.ylim(0.92, 0.98)
+plt.tick_params(axis='x', rotation=45)
+plt.ylabel('Score (%)')
+plt.title('Precision')
+plt.show()
+
+# Recall 
+plt.figure(figsize=(7,7)) 
+sns.barplot(data=Performance_scores, x='Model', y='recall', width=0.5, hue='Model', 
+            order=['Logistic Regression', 'XGBoost', 'Random Forest', 'Neural Network'] )
+plt.ylim(0.92, 0.98)
+plt.tick_params(axis='x', rotation=45)
+plt.ylabel('Score (%)')
+plt.title('Recall')
+plt.show()
+
+# F1 score 
+plt.figure(figsize=(7,7)) 
+sns.barplot(data=Performance_scores, x='Model', y='f1-score', width=0.5, hue='Model', 
+            order=['Logistic Regression', 'XGBoost', 'Random Forest', 'Neural Network'] )
+plt.ylim(0.92, 0.98)
+plt.tick_params(axis='x', rotation=45)
+plt.ylabel('Score (%)')
+plt.title('F1 Score')
+plt.show()
+
+
